@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 // -- Shared Infrastructure Modules --
+pub mod audit;
 pub mod config;
 pub mod crypto;
 pub mod database;

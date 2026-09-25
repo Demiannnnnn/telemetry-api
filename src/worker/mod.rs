@@ -237,4 +237,162 @@ mod tests {
 
         assert!(!list_after.data.iter().any(|w| w.id == worker_id));
     }
+
+    #[tokio::test]
+    async fn test_dsr_export_request_creates_audit_log() {
+        let Some(state) = setup_app_state().await else {
+            eprintln!("Skipping DB test: PostgreSQL not reachable");
+            return;
+        };
+
+        let worker_id = Uuid::new_v4();
+        let worker_auth = RequireWorker(AuthUser {
+            id: worker_id,
+            role: UserRole::Worker,
+            email: "dsr_worker@example.com".to_string(),
+        });
+
+        let export_req = DataExportRequest {
+            r#type: "EXPORT".to_string(),
+            categories: vec![
+                "system_activity".to_string(),
+                "network_activity".to_string(),
+            ],
+            from: None,
+            to: None,
+        };
+
+        let (status, Json(res)) = handlers::request_data_export(
+            worker_auth,
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(export_req),
+        )
+        .await
+        .expect("Request export");
+
+        assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+        assert_eq!(res.data.status, "PENDING");
+
+        // Verify audit log entry
+        let audit_row = sqlx::query!(
+            r#"
+            SELECT action, resource_type, resource_id, metadata
+            FROM audit_logs
+            WHERE actor_id = $1 AND action = 'DATA_EXPORT_REQUESTED'
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            worker_id
+        )
+        .fetch_one(&state.db)
+        .await
+        .expect("Audit log row");
+
+        assert_eq!(audit_row.action, "DATA_EXPORT_REQUESTED");
+        assert_eq!(audit_row.resource_type, "telemetry");
+        assert_eq!(audit_row.resource_id, Some(worker_id));
+        let meta = audit_row.metadata.expect("Metadata present");
+        assert!(meta.to_string().contains("system_activity"));
+        assert!(meta.to_string().contains(&res.data.request_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_dsr_deletion_request_creates_audit_log() {
+        let Some(state) = setup_app_state().await else {
+            eprintln!("Skipping DB test: PostgreSQL not reachable");
+            return;
+        };
+
+        let worker_id = Uuid::new_v4();
+        let worker_auth = RequireWorker(AuthUser {
+            id: worker_id,
+            role: UserRole::Worker,
+            email: "dsr_del_worker@example.com".to_string(),
+        });
+
+        let del_req = DataDeletionRequest {
+            categories: vec!["all".to_string()],
+            reason: Some("Personal request under GDPR".to_string()),
+        };
+
+        let (status, Json(res)) = handlers::request_data_deletion(
+            worker_auth,
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(del_req),
+        )
+        .await
+        .expect("Request deletion");
+
+        assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+        assert_eq!(res.data.status, "PENDING");
+
+        // Verify audit log entry
+        let audit_row = sqlx::query!(
+            r#"
+            SELECT action, resource_type, resource_id, metadata
+            FROM audit_logs
+            WHERE actor_id = $1 AND action = 'DATA_DELETION_REQUESTED'
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            worker_id
+        )
+        .fetch_one(&state.db)
+        .await
+        .expect("Audit log row");
+
+        assert_eq!(audit_row.action, "DATA_DELETION_REQUESTED");
+        assert_eq!(audit_row.resource_type, "telemetry");
+        assert_eq!(audit_row.resource_id, Some(worker_id));
+        let meta = audit_row.metadata.expect("Metadata present");
+        assert!(meta.to_string().contains("all"));
+        assert!(meta.to_string().contains("Personal request under GDPR"));
+    }
+
+    #[tokio::test]
+    async fn test_dsr_rate_limit_exceeded_returns_429() {
+        let Some(state) = setup_app_state().await else {
+            eprintln!("Skipping DB test: PostgreSQL not reachable");
+            return;
+        };
+
+        let worker_id = Uuid::new_v4();
+        let worker_auth = RequireWorker(AuthUser {
+            id: worker_id,
+            role: UserRole::Worker,
+            email: "dsr_limit_worker@example.com".to_string(),
+        });
+
+        let export_req = DataExportRequest {
+            r#type: "EXPORT".to_string(),
+            categories: vec!["system_activity".to_string()],
+            from: None,
+            to: None,
+        };
+
+        // Submit 5 requests (the daily maximum)
+        for _ in 0..5 {
+            let res = handlers::request_data_export(
+                worker_auth.clone(),
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(export_req.clone()),
+            )
+            .await;
+            assert!(res.is_ok());
+        }
+
+        // 6th request must be rejected with RateLimited (429)
+        let res6 = handlers::request_data_export(
+            worker_auth,
+            State(state),
+            axum::http::HeaderMap::new(),
+            Json(export_req),
+        )
+        .await;
+
+        assert!(matches!(res6, Err(crate::errors::AppError::RateLimited)));
+    }
 }

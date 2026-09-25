@@ -4,7 +4,8 @@
 
 use crate::{
     worker::handlers::{
-        create_worker, delete_worker, get_worker, list_workers, update_consent, update_worker,
+        create_worker, delete_worker, get_worker, list_workers, request_data_deletion,
+        request_data_export, update_consent, update_worker,
     },
     AppState,
 };
@@ -18,6 +19,8 @@ use std::sync::Arc;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", post(create_worker).get(list_workers))
+        .route("/me/data-request", post(request_data_export))
+        .route("/me/data-deletion", post(request_data_deletion))
         .route(
             "/:id",
             get(get_worker).put(update_worker).delete(delete_worker),

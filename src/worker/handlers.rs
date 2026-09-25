@@ -7,14 +7,15 @@ use crate::{
     middleware::{verify_admin_owns_worker, AuthUser, RequireAdmin, RequireWorker},
     models::{CollectionResponse, PaginationMeta, PaginationParams, SingleResponse},
     worker::models::{
-        ConsentFlags, CreateWorkerRequest, UpdateConsentRequest, UpdateWorkerRequest,
+        ConsentFlags, CreateWorkerRequest, DataDeletionRequest, DataDeletionResponse,
+        DataExportRequest, DataRequestResponse, UpdateConsentRequest, UpdateWorkerRequest,
         WorkerQueryParams, WorkerRecord, WorkerResponse, WorkerRoleType,
     },
     AppState,
 };
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use std::sync::Arc;
@@ -394,7 +395,173 @@ pub async fn update_consent(
     .await
     .map_err(AppError::Database)?;
 
+    let _ = crate::audit::record_audit_event(
+        &state.db,
+        worker_auth.id,
+        worker_auth.role,
+        "CONSENT_UPDATED",
+        "worker",
+        Some(worker_id),
+        None,
+        Some(consent_json),
+    )
+    .await;
+
     tracing::info!(worker_id = %worker_id, "Worker consent flags updated");
 
     Ok(Json(SingleResponse::new(payload.consent_flags)))
+}
+
+/// Requests a complete export of the worker's historical telemetry data (GDPR/ARCO).
+pub async fn request_data_export(
+    RequireWorker(worker): RequireWorker,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<DataExportRequest>,
+) -> Result<(StatusCode, Json<SingleResponse<DataRequestResponse>>), AppError> {
+    payload
+        .validate()
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    if payload.r#type != "EXPORT" {
+        return Err(AppError::Validation(
+            "Request type must be 'EXPORT'".to_string(),
+        ));
+    }
+
+    if let (Some(from), Some(to)) = (payload.from, payload.to) {
+        if from > to {
+            return Err(AppError::Validation(
+                "'from' timestamp must precede 'to' timestamp".to_string(),
+            ));
+        }
+    }
+
+    // Rate limit: Max 5 DSR requests per 24 hours per worker
+    let dsr_count = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*)
+        FROM audit_logs
+        WHERE actor_id = $1
+          AND action IN ('DATA_EXPORT_REQUESTED', 'DATA_DELETION_REQUESTED')
+          AND created_at >= NOW() - INTERVAL '24 hours'
+        "#,
+        worker.id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(AppError::Database)?
+    .unwrap_or(0);
+
+    if dsr_count >= 5 {
+        return Err(AppError::RateLimited);
+    }
+
+    let request_id = Uuid::now_v7();
+    let estimated_completion = chrono::Utc::now() + chrono::Duration::hours(1);
+
+    let meta = serde_json::json!({
+        "categories": payload.categories,
+        "from": payload.from,
+        "to": payload.to,
+        "request_id": request_id,
+    });
+
+    crate::audit::record_audit_event(
+        &state.db,
+        worker.id,
+        worker.role,
+        "DATA_EXPORT_REQUESTED",
+        "telemetry",
+        Some(worker.id),
+        Some(&headers),
+        Some(meta),
+    )
+    .await?;
+
+    tracing::info!(
+        worker_id = %worker.id,
+        request_id = %request_id,
+        action = "DSR_REQUEST",
+        "Data export request registered"
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SingleResponse::new(DataRequestResponse {
+            request_id,
+            status: "PENDING",
+            estimated_completion,
+        })),
+    ))
+}
+
+/// Requests the purge/erasure of historical telemetry data (GDPR/ARCO Right to be Forgotten).
+pub async fn request_data_deletion(
+    RequireWorker(worker): RequireWorker,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<DataDeletionRequest>,
+) -> Result<(StatusCode, Json<SingleResponse<DataDeletionResponse>>), AppError> {
+    payload
+        .validate()
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    // Rate limit: Max 5 DSR requests per 24 hours per worker
+    let dsr_count = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*)
+        FROM audit_logs
+        WHERE actor_id = $1
+          AND action IN ('DATA_EXPORT_REQUESTED', 'DATA_DELETION_REQUESTED')
+          AND created_at >= NOW() - INTERVAL '24 hours'
+        "#,
+        worker.id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(AppError::Database)?
+    .unwrap_or(0);
+
+    if dsr_count >= 5 {
+        return Err(AppError::RateLimited);
+    }
+
+    let request_id = Uuid::now_v7();
+
+    let meta = serde_json::json!({
+        "categories": payload.categories,
+        "reason": payload.reason,
+        "request_id": request_id,
+    });
+
+    crate::audit::record_audit_event(
+        &state.db,
+        worker.id,
+        worker.role,
+        "DATA_DELETION_REQUESTED",
+        "telemetry",
+        Some(worker.id),
+        Some(&headers),
+        Some(meta),
+    )
+    .await?;
+
+    tracing::info!(
+        worker_id = %worker.id,
+        request_id = %request_id,
+        action = "DSR_REQUEST",
+        "Data deletion request registered"
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SingleResponse::new(DataDeletionResponse {
+            request_id,
+            status: "PENDING",
+            message:
+                "Data deletion request accepted and will be purged according to retention policy"
+                    .to_string(),
+        })),
+    ))
 }

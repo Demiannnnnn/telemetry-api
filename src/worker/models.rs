@@ -213,3 +213,49 @@ impl WorkerRecord {
         }
     }
 }
+
+/// Request DTO for data portability / export request (GDPR/ARCO).
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct DataExportRequest {
+    /// Type of request (must be "EXPORT").
+    pub r#type: String,
+    /// Telemetry categories to export.
+    #[validate(length(min = 1, message = "At least one category must be specified"))]
+    pub categories: Vec<String>,
+    /// Optional lower timestamp bound.
+    pub from: Option<DateTime<Utc>>,
+    /// Optional upper timestamp bound.
+    pub to: Option<DateTime<Utc>>,
+}
+
+/// Response DTO for data export acceptance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataRequestResponse {
+    /// Unique tracking ID for the export request.
+    pub request_id: Uuid,
+    /// Current request processing status.
+    pub status: &'static str,
+    /// Estimated completion timestamp.
+    pub estimated_completion: DateTime<Utc>,
+}
+
+/// Request DTO for data deletion / right to be forgotten (GDPR/ARCO).
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct DataDeletionRequest {
+    /// Categories of telemetry data to delete (e.g. ["all"] or specific category list).
+    #[validate(length(min = 1, message = "At least one category must be specified"))]
+    pub categories: Vec<String>,
+    /// Stated reason for the deletion request.
+    pub reason: Option<String>,
+}
+
+/// Response DTO for data deletion acceptance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataDeletionResponse {
+    /// Unique tracking ID for the deletion request.
+    pub request_id: Uuid,
+    /// Current request processing status.
+    pub status: &'static str,
+    /// Confirmation message detailing retention and grace period policy.
+    pub message: String,
+}
